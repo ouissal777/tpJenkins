@@ -2,42 +2,33 @@ pipeline {
     agent {
         docker {
             image 'ilyes94/maven-docker-java17'
-            args '-v /root/.m2:/root/.m2 -v /var/run/docker.sock:/var/run/docker.sock'  
+            args '-v /root/.m2:/root/.m2 -v /var/run/docker.sock:/var/run/docker.sock'
         }
-
-
-
     }
- 
+
     triggers {
-        cron 'H/30 * * * *'  
+        cron 'H/30 * * * *'
     }
- 
+
     environment {
-        DOCKERHUB_CREDENTIALS = credentials('dockerHub')
-        DOCKER_CONFIG = '/tmp/.docker'  
+        APP_NAME    = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.name',    returnStdout: true).trim()
+        APP_VERSION = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version', returnStdout: true).trim()
+        SONAR_HOST_URL = 'http://13.69.247.235:9000'
+        DOCKER_CONFIG = '/tmp/.docker'
     }
- 
+
     stages {
+
         stage('Build') {
             steps {
-                script {
-                    def name = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.name', returnStdout: true).trim()
-                    def version = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version', returnStdout: true).trim()
-                    sh 'docker info'  
-                    sh 'mvn -B -DskipTests clean package'
-                }
+                sh 'mvn -B -DskipTests clean package'
             }
         }
- 
+
+        
         stage('Test') {
             steps {
-                script {
-                    def name = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.name', returnStdout: true).trim()
-                    def version = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version', returnStdout: true).trim()
-                    sh 'docker info'
-                    sh 'mvn test'
-                }
+                sh 'mvn test'
             }
             post {
                 always {
@@ -45,64 +36,78 @@ pipeline {
                 }
             }
         }
- 
+
         stage('SonarQube Analysis') {
             steps {
                 withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
                     sh """
-                        mvn clean verify sonar:sonar \
-                          -Dsonar.projectKey=ajava-maven-project \
-                          -Dsonar.projectName='ajava-maven-project' \
-                          -Dsonar.host.url=http://13.69.247.235:9000 \
+                        mvn sonar:sonar \
+                          -Dsonar.projectKey=${env.APP_NAME} \
+                          -Dsonar.projectName='${env.APP_NAME}' \
+                          -Dsonar.host.url=${env.SONAR_HOST_URL} \
                           -Dsonar.token=${SONAR_TOKEN}
                     """
                 }
             }
         }
- 
- //        stage('Code Coverage') {
+
         stage('Deliver') {
             steps {
                 sh 'bash ./jenkins/scripts/deliver.sh'
             }
         }
- 
+
         stage('Docker Build') {
             steps {
-                script {
-                    def name = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.name', returnStdout: true).trim()
-                    def version = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version', returnStdout: true).trim()
-                    sh "docker build -t ${name}:${version} -f Dockerfile ."
-                }
+                sh "docker build -t ${env.APP_NAME}:${env.APP_VERSION} -f Dockerfile ."
             }
         }
- 
+
         stage('Docker Push') {
             steps {
-                script {
-                    def name = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.name', returnStdout: true).trim()
-                    def version = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version', returnStdout: true).trim()
-                    withCredentials([usernamePassword(credentialsId: 'dockerHub', passwordVariable: 'dockerHubPassword', usernameVariable: 'dockerHubUser')]) {
-                        sh """
-                            echo ${env.dockerHubPassword} | docker login -u ${env.dockerHubUser} --password-stdin
-                            docker tag ${name}:${version} ${env.dockerHubUser}/${name}:${version}
-                            docker push ${env.dockerHubUser}/${name}:${version}
-                        """
-                    }
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerHub',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker tag ${env.APP_NAME}:${env.APP_VERSION} ${DOCKER_USER}/${env.APP_NAME}:${env.APP_VERSION}
+                        docker push ${DOCKER_USER}/${env.APP_NAME}:${env.APP_VERSION}
+                    """
                 }
             }
         }
- 
-        stage('Run Docker Container') {
+
+        stage('Deploy') {
             steps {
-                script {
-                    def name = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.name', returnStdout: true).trim()
-                    def version = sh(script: 'mvn -q -DforceStdout help:evaluate -Dexpression=project.version', returnStdout: true).trim()
-                    withCredentials([usernamePassword(credentialsId: 'dockerHub', passwordVariable: 'dockerHubPassword', usernameVariable: 'dockerHubUser')]) {
-                        sh "docker run -d --name ${name}-${version}-$BUILD_NUMBER ${env.dockerHubUser}/${name}:${version}"
-                    }
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerHub',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        docker stop  ${env.APP_NAME} || true
+                        docker rm    ${env.APP_NAME} || true
+                        docker run -d \
+                            --name ${env.APP_NAME} \
+                            --restart unless-stopped \
+                            ${DOCKER_USER}/${env.APP_NAME}:${env.APP_VERSION}
+                    """
                 }
             }
+        }
+    }
+
+    post {
+        success {
+            echo " Pipeline terminé avec succès — ${env.APP_NAME}:${env.APP_VERSION}"
+        }
+        failure {
+            echo " Pipeline échoué — vérifiez les logs ci-dessus"
+        }
+        always {
+            sh 'docker logout || true'
         }
     }
 }
